@@ -1,0 +1,26 @@
+# virtual env
+.venv/
+venv/
+env/
+ENV/
+
+# env Variables 
+.env
+*.env
+
+# pyton cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# IDE configs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# os files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,14 @@
+# Backend
+fastapi==0.136.1
+uvicorn==0.47.0
+pydantic==2.13.4
+python-dotenv==1.2.2
+requests==2.34.2
+
+# LangChain / LangGraph
+langchain-core==1.4.0
+langchain-groq==1.1.2
+langgraph==1.2.0
+
+# Vector store
+chromadb==1.5.9
