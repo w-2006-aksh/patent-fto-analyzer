@@ -159,32 +159,23 @@ def fetch_patent_claims(token: str, patent_id: str) -> str:
             return ""
 
         # each <claim-text> becomes one line for the numbered-claim regex later
-        en_texts: list[str] = []
-        other_texts: list[str] = []
+        claims_blocks = root.findall(".//{*}claims")
+        en_blocks = [b for b in claims_blocks if (b.get("lang") or "").upper() == "EN"]
+        blocks_to_parse = en_blocks if en_blocks else claims_blocks
 
-        for elem in root.iter():
-            local = elem.tag.split("}")[1] if "}" in elem.tag else elem.tag
-            if local != "claims":
-                continue
-            lang = elem.get("lang", "").upper()
-            texts: list[str] = []
-            for child in elem:
-                child_local = child.tag.split("}")[1] if "}" in child.tag else child.tag
-                if child_local == "claim":
-                    for grandchild in child:
-                        gc_local = grandchild.tag.split("}")[1] if "}" in grandchild.tag else grandchild.tag
-                        if gc_local == "claim-text":
-                            text = " ".join(grandchild.itertext()).split()
-                            if text:
-                                texts.append(" ".join(text))
-            if lang == "EN":
-                en_texts.extend(texts)
-            else:
-                other_texts.extend(texts)
+        if not blocks_to_parse:
+            print(f"{patent_id}: no claims in xml")
+            return ""
 
-        chosen = en_texts or other_texts
-        result = "\n".join(chosen)
-        print(f"{patent_id}: got {len(chosen)} claims")
+        texts: list[str] = []
+        for block in blocks_to_parse:
+            for node in block.findall(".//{*}claim-text"):
+                text = " ".join(node.itertext()).split()
+                if text:
+                    texts.append(" ".join(text))
+
+        result = "\n".join(texts)
+        print(f"{patent_id}: got {len(texts)} claims")
         return result
 
     except Exception as exc:

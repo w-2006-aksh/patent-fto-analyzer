@@ -2,7 +2,6 @@ from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from pipeline import app, memory
@@ -74,30 +73,30 @@ def start_analysis(request: AnalysisRequest):
 
     # no results. skip review, report is already done
     if phase1_state.get("final_report"):
-        return JSONResponse(content={
+        return {
             "thread_id": thread_id,
             "idea": request.idea,
             "complete": True,
             "risk_assessments": phase1_state.get("risk_assessments", []),
             "cleared_patents": phase1_state.get("cleared_patents", []),
             "report": phase1_state["final_report"],
-        })
+        }
 
-    return JSONResponse(content={
+    return {
         "thread_id": thread_id,
         "idea": request.idea,
         "complete": False,
         "risk_assessments": phase1_state.get("risk_assessments", []),
-    })
+    }
 
 
 @api.post("/approve_analysis")
 def approve_analysis(request: ApproveRequest):
     if not request.approved:
-        return JSONResponse(content={
+        return {
             "cancelled": True,
             "message": "Analysis cancelled.",
-        })
+        }
 
     config = {"configurable": {"thread_id": request.thread_id}}
 
@@ -114,12 +113,12 @@ def approve_analysis(request: ApproveRequest):
             )
         raise HTTPException(status_code=500, detail=str(e))
 
-    return JSONResponse(content={
+    return {
         "idea": final_state.get("user_idea", ""),
         "risk_assessments": final_state.get("risk_assessments", []),
         "cleared_patents": final_state.get("cleared_patents", []),
         "report": final_state.get("final_report", ""),
-    })
+    }
 
 
 if __name__ == "__main__":

@@ -31,9 +31,8 @@ def build_relevance_context(patent: dict) -> str:
     if patent.get("context_type") == "claim":
         claims_text = (patent.get("claims_text") or "").strip()
         if claims_text:
-            head = claims_text[:_RELEVANCE_CLAIM_EXCERPT_MAX]
-            excerpt = " ".join(head.split())
-            parts.append(f"Claims (excerpt): {excerpt}")
+           excerpt = " ".join(claims_text.split())[:_RELEVANCE_CLAIM_EXCERPT_MAX]
+           parts.append(f"Claims (excerpt): {excerpt}")
 
     return "\n".join(parts)[:_RELEVANCE_TOTAL_MAX]
 
