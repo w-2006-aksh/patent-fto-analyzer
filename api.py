@@ -1,3 +1,4 @@
+import os
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
@@ -8,9 +9,13 @@ from pipeline import app, memory
 
 api = FastAPI(title="Patent FTO API")
 
+
+frontend_url = os.getenv("ALLOWED_ORIGINS")
+_allowed_origins = [frontend_url] if frontend_url else []
+
 api.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=_allowed_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )

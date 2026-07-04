@@ -1,3 +1,12 @@
+const API_BASE = import.meta.env.VITE_API_URL || "";
+
+function apiPath(path) {
+  if (API_BASE) {
+    return `${API_BASE.replace(/\/$/, "")}${path}`;
+  }
+  return `/api${path}`;
+}
+
 async function _post(path, body) {
   const response = await fetch(path, {
     method: "POST",
@@ -12,9 +21,9 @@ async function _post(path, body) {
 }
 
 export function startAnalysis(idea) {
-  return _post("/api/start_analysis", { idea });
+  return _post(apiPath("/start_analysis"), { idea });
 }
 
 export function approveAnalysis(thread_id, approved) {
-  return _post("/api/approve_analysis", { thread_id, approved });
+  return _post(apiPath("/approve_analysis"), { thread_id, approved });
 }
