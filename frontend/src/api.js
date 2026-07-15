@@ -21,9 +21,9 @@ async function _post(path, body) {
 }
 
 export function startAnalysis(idea) {
-  return _post(apiPath("/start_analysis"), { idea });
+  return _post("/start_analysis", { idea });
 }
 
 export function approveAnalysis(thread_id, approved) {
-  return _post(apiPath("/approve_analysis"), { thread_id, approved });
+  return _post("/approve_analysis", { thread_id, approved });
 }
