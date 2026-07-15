@@ -11,9 +11,8 @@ export default function ReviewPanel({ idea, assessments, onApprove }) {
       <p className="text-slate-400 italic text-sm mb-4">&ldquo;{idea}&rdquo;</p>
 
       <div className="bg-blue-500/10 border border-blue-500/30 rounded-lg p-3 mb-5 text-sm text-blue-300">
-        <strong>{assessments.length} patent{assessments.length !== 1 ? "s" : ""} assessed.</strong>{" "}
-        These are preliminary findings. Approve below to generate the full legal FTO report
-        (patents with overlap &gt; 0.2 will be analysed in depth; others will be listed as cleared).
+      <strong>{assessments.length} patent{assessments.length !== 1 ? "s" : ""} assessed.</strong>{" "}
+      Review the findings below. Click approve to summarize all available patents and generate a downloadable Markdown report.
       </div>
 
       <div className="grid grid-cols-3 gap-3 mb-5">
