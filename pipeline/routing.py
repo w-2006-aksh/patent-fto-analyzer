@@ -2,6 +2,16 @@ import re
 from .state import FTOState
 
 _SIGNIFICANT_OVERLAP_THRESHOLD = 0.2
+_PATENT_ID_RE = re.compile(r"\b[A-Z]{2}\.\d+\.[A-Z]\d*\b")
+
+
+def sort_assessments_by_overlap(assessments: list) -> list:
+    return sorted(assessments, key=lambda a: a.get("overlap_score") or 0, reverse=True)
+
+
+def find_hallucinated_patent_ids(report: str, allowed_ids: set[str]) -> set[str]:
+    mentioned = set(_PATENT_ID_RE.findall(report or ""))
+    return mentioned - allowed_ids
 
 _RELEVANCE_ABSTRACT_MAX = 500
 _RELEVANCE_CLAIM_EXCERPT_MAX = 400

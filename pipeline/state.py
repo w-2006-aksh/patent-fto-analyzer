@@ -20,6 +20,15 @@ class FTOReport(BaseModel):
     assessments: List[ReportAssessment] = Field(description="risk list")
 
 
+class RelevanceScoreEntry(BaseModel):
+    patent_id: str = Field(description="patent id")
+    score: int = Field(description="0-10 relevance score", ge=0, le=10)
+
+
+class RelevanceBatch(BaseModel):
+    scores: List[RelevanceScoreEntry] = Field(description="relevance scores per patent")
+
+
 class FTOState(TypedDict):
     user_idea: str
     sub_queries: List[str]

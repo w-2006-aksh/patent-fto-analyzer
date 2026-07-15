@@ -2,19 +2,25 @@ import re
 import chromadb
 
 # max chars when dumping raw claims as one blob
-_RAW_TEXT_MAX_CHARS = 8_000
+_RAW_TEXT_MAX_CHARS = 10_000
+
+_sessions: dict[str, tuple] = {}
 
 
-def initialize_vector_db(reset: bool = False):
-    print("init chromadb...")
-    client = chromadb.PersistentClient(path="./patent_db")
-    if reset:
-        try:
-            client.delete_collection("patent_claims")
-        except Exception:
-            pass
+def create_ephemeral_collection(session_id: str):
+    client = chromadb.EphemeralClient()
     collection = client.get_or_create_collection(name="patent_claims")
+    _sessions[session_id] = (client, collection)
     return collection
+
+
+def get_ephemeral_collection(session_id: str):
+    entry = _sessions.get(session_id)
+    return entry[1] if entry else None
+
+
+def drop_ephemeral_session(session_id: str):
+    _sessions.pop(session_id, None)
 
 
 def load_claims_to_db(collection, patents: list):
@@ -28,9 +34,9 @@ def load_claims_to_db(collection, patents: list):
     ids = []
 
     for patent in patents:
-        patent_id    = patent["id"]
+        patent_id = patent["id"]
         patent_title = patent.get("title", "")
-        claims_text  = patent.get("claims_text", "").strip()
+        claims_text = patent.get("claims_text", "").strip()
         context_type = patent.get("context_type", "claim")
 
         if context_type == "abstract_fallback":
@@ -51,7 +57,7 @@ def load_claims_to_db(collection, patents: list):
             continue
 
         if claims_text:
-            # split on "1. ", "2. " at line start 
+            # split on "1. ", "2. " at line start
             parts  = re.split(r"(?m)(?=^\d+\.\s)", claims_text)
             chunks = [p.strip() for p in parts if p.strip()]
 
@@ -130,7 +136,7 @@ def _hit_from_meta(doc: str, meta: dict) -> dict:
 def retrieve_top_claims_per_patent(
     collection, user_idea: str, patent_ids: list, n_per_patent: int = 2
 ) -> list:
-    # top n claims per patent (not one global top-k)
+    # top n claims per patent 
     if collection.count() == 0:
         return []
 

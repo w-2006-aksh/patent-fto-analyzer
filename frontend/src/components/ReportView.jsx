@@ -3,7 +3,7 @@ import { riskBorderClass, riskBadgeClass } from "../utils.js";
 
 export default function ReportView({ result, onDownload, onReset }) {
   const significant = result.risk_assessments ?? [];
-  const cleared     = result.cleared_patents   ?? [];
+  const cleared     = result.cleared_patents ?? [];
 
   const highCount   = significant.filter(a => a.risk_level?.toUpperCase() === "HIGH").length;
   const mediumCount = significant.filter(a => a.risk_level?.toUpperCase() === "MEDIUM").length;

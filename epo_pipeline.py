@@ -1,6 +1,7 @@
 import os
 import base64
 import time
+import threading
 import requests
 import json
 import xml.etree.ElementTree as ET
@@ -13,8 +14,24 @@ EPO_SECRET = os.getenv("EPO_API_SECRET")
 _DEFAULT_TIMEOUT = 30
 
 
+_epo_dispatch_lock = threading.Lock()
+_epo_last_dispatch = 0.0
+_EPO_MIN_GAP = 0.4
+
+
+def _throttle_epo_dispatch() -> None:
+    global _epo_last_dispatch
+    with _epo_dispatch_lock:
+        now = time.time()
+        gap = _EPO_MIN_GAP - (now - _epo_last_dispatch)
+        if gap > 0:
+            time.sleep(gap)
+        _epo_last_dispatch = time.time()
+
+
 def _epo_get(url, headers, params=None, max_retries=3):
     for attempt in range(1, max_retries + 1):
+        _throttle_epo_dispatch()
         response = requests.get(url, headers=headers, params=params, timeout=_DEFAULT_TIMEOUT)
         if response.status_code == 429:
             retry_after = int(response.headers.get("Retry-After", 60))
@@ -27,6 +44,7 @@ def _epo_get(url, headers, params=None, max_retries=3):
 
 def _epo_post(url, headers, data, max_retries=3):
     for attempt in range(1, max_retries + 1):
+        _throttle_epo_dispatch()
         response = requests.post(url, headers=headers, data=data, timeout=_DEFAULT_TIMEOUT)
         if response.status_code == 429:
             retry_after = int(response.headers.get("Retry-After", 60))
@@ -136,7 +154,8 @@ def hydrate_patents(token, id_list):
 hydrate_and_clean_batch = hydrate_patents
 
 
-def fetch_patent_claims(token: str, patent_id: str) -> str:
+def fetch_patent_claims(token: str, patent_id: str) -> tuple[str, str]:
+    """Returns (claims_text, language_code). language_code is EN when available."""
     try:
         response = _epo_get(
             f"https://ops.epo.org/3.2/rest-services/published-data/publication/epodoc/{patent_id}/claims",
@@ -148,7 +167,7 @@ def fetch_patent_claims(token: str, patent_id: str) -> str:
 
         if response.status_code == 404:
             print(f"{patent_id}: claims not found (404)")
-            return ""
+            return "", ""
 
         response.raise_for_status()
 
@@ -156,16 +175,18 @@ def fetch_patent_claims(token: str, patent_id: str) -> str:
             root = ET.fromstring(response.content)
         except ET.ParseError as exc:
             print(f"{patent_id}: xml parse error: {exc}")
-            return ""
+            return "", ""
 
-        # each <claim-text> becomes one line for the numbered-claim regex later
         claims_blocks = root.findall(".//{*}claims")
         en_blocks = [b for b in claims_blocks if (b.get("lang") or "").upper() == "EN"]
         blocks_to_parse = en_blocks if en_blocks else claims_blocks
 
         if not blocks_to_parse:
             print(f"{patent_id}: no claims in xml")
-            return ""
+            return "", ""
+
+        claims_lang = (en_blocks[0].get("lang") if en_blocks else blocks_to_parse[0].get("lang") or "")
+        claims_lang = claims_lang.upper()
 
         texts: list[str] = []
         for block in blocks_to_parse:
@@ -175,17 +196,15 @@ def fetch_patent_claims(token: str, patent_id: str) -> str:
                     texts.append(" ".join(text))
 
         result = "\n".join(texts)
-        print(f"{patent_id}: got {len(texts)} claims")
-        return result
+        print(f"{patent_id}: got {len(texts)} claims ({claims_lang or 'unknown'})")
+        return result, claims_lang
 
     except Exception as exc:
         print(f"{patent_id}: claims error: {exc}")
-        return ""
-
+        return "", ""
 
 
 def _extract_fields(doc):
-    # needs dotted id like EP.3695720.A1 for claims endpoint
     doc_id = f"{doc.get('@country', '')}.{doc.get('@doc-number', '')}.{doc.get('@kind', '')}"
     biblio = doc.get("bibliographic-data", {})
 

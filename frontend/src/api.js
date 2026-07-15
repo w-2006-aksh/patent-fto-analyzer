@@ -8,7 +8,7 @@ function apiPath(path) {
 }
 
 async function _post(path, body) {
-  const response = await fetch(path, {
+  const response = await fetch(apiPath(path), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),

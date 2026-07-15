@@ -21,6 +21,5 @@ __pycache__/
 *.swp
 *.swo
 
-# os files
-.DS_Store
-Thumbs.db
+# chromadb local store (legacy — no longer used after ephemeral migration)
+patent_db/

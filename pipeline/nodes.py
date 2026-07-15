@@ -11,35 +11,43 @@ from epo_pipeline import (
     hydrate_patents,
     fetch_patent_claims,
 )
+from langchain_core.runnables import RunnableConfig
+
 from vectorengine import (
-    initialize_vector_db,
+    create_ephemeral_collection,
+    drop_ephemeral_session,
+    get_ephemeral_collection,
     load_claims_to_db,
     retrieve_top_claims_per_patent,
 )
 
 from .state import FTOState
-from .llm import llm, structured_risk_llm, structured_report_llm, call_llm_with_retry
+from .llm import (
+    llm,
+    structured_risk_llm,
+    structured_report_llm,
+    structured_relevance_llm,
+    call_llm_with_retry,
+    call_structured_with_retry,
+)
 from .routing import (
     sanitize_epo_query,
     _SIGNIFICANT_OVERLAP_THRESHOLD,
     merge_top_patent_ids,
     build_relevance_context,
+    sort_assessments_by_overlap,
+    find_hallucinated_patent_ids,
 )
 
 
 def _llm_text(response) -> str:
-    text = response.content if hasattr(response, "content") else str(response)
+    text = response.content
     if isinstance(text, list):
         text = " ".join(
-            item["text"] if isinstance(item, dict) and "text" in item else str(item)
+            item.get("text", str(item)) if isinstance(item, dict) else str(item)
             for item in text
         )
-    return text.strip()
-
-
-def _strip_json_fences(raw: str) -> str:
-    raw = re.sub(r"^```(?:json)?\s*", "", raw)
-    return re.sub(r"\s*```$", "", raw)
+    return str(text).strip()
 
 
 def node_expand_queries(state: FTOState):
@@ -167,26 +175,19 @@ def node_retrieve_patents(state: FTOState):
     hydrated = hydrate_patents(token, top_20_ids)
     results: List[dict] = [{**patent, "source": "epo"} for patent in hydrated]
 
-    # EPO rate limit (~2.5 rps)
-    dispatch_lock = threading.Lock()
-    last_dispatch = [0.0]
-    min_gap = 0.4
-
     def _fetch_claims(patent: dict) -> dict:
         pid = patent["id"]
-        with dispatch_lock:
-            now = time.time()
-            gap = min_gap - (now - last_dispatch[0])
-            if gap > 0:
-                time.sleep(gap)
-            last_dispatch[0] = time.time()
-
-        claims = fetch_patent_claims(token, pid)
+        claims, claims_lang = fetch_patent_claims(token, pid)
         out = dict(patent)
         if claims:
             out["claims_text"] = claims
-            out["context_type"] = "claim"
-            print(f"{pid}: got claims")
+            if claims_lang and claims_lang != "EN":
+                out["context_type"] = "non_english_claims"
+                out["claims_lang"] = claims_lang
+                print(f"{pid}: found non-english claims ({claims_lang})")
+            else:
+                out["context_type"] = "claim"
+                print(f"{pid}: got claims")
         else:
             out["claims_text"] = patent.get("text_for_vector_db", "")
             out["context_type"] = "abstract_fallback"
@@ -241,17 +242,16 @@ def node_filter_relevant_patents(state: FTOState):
         "  4–6  = shares some mechanical/functional concepts, worth analysing\n"
         "  7–10 = directly relevant technical overlap\n\n"
         f"Patents to score:\n" + "\n".join(patent_lines) + "\n\n"
-        'Return ONLY a JSON array: [{"patent_id": "...", "score": 7}, ...]\n'
-        "Scores 0-10. No explanation."
+        "Return a JSON object with a `scores` array. Each entry must have "
+        '`patent_id` (string) and `score` (integer 0-10). '
+        "Include every patent listed above exactly once."
     )
 
-    raw = _strip_json_fences(_llm_text(call_llm_with_retry(llm, prompt)))
-
     try:
-        scored = json.loads(raw)
-        score_map = {entry["patent_id"]: int(entry["score"]) for entry in scored}
+        result = call_structured_with_retry(structured_relevance_llm, prompt)
+        score_map = {entry.patent_id: int(entry.score) for entry in result.scores}
     except Exception:
-        print("json parse failed, defaulting all to score 5")
+        print("structured relevance failed, defaulting all to score 5")
         for patent in candidates:
             patent["relevance_score"] = 5
         return {"raw_patents": candidates}
@@ -300,58 +300,71 @@ def node_no_results(state: FTOState):
     }
 
 
-def node_seed_claims_to_chromadb(state: FTOState):
-    print("loading claims into chromadb...")
-    collection = initialize_vector_db(reset=True)
+def _session_id(config: RunnableConfig) -> str:
+    return config["configurable"]["thread_id"]
+
+
+def node_seed_claims_to_chromadb(state: FTOState, config: RunnableConfig):
+    session_id = _session_id(config)
+    print(f"loading claims into chromadb (session {session_id[:8]}...)...")
+    collection = create_ephemeral_collection(session_id)
     load_claims_to_db(collection, state["raw_patents"])
     return {}
 
 
-def node_retrieve_top_claims(state: FTOState):
+def node_retrieve_top_claims(state: FTOState, config: RunnableConfig):
+    session_id = _session_id(config)
     print("fetching top claims from chromadb...")
-    collection = initialize_vector_db()
-    patent_ids = [p["id"] for p in state["raw_patents"]]
-    hits = retrieve_top_claims_per_patent(
-        collection, state["user_idea"], patent_ids, n_per_patent=2
-    )
+    collection = get_ephemeral_collection(session_id)
 
-    if not hits:
-        print("chromadb empty, using abstracts")
-        hits = [
-            {
-                "patent_id": p["id"],
-                "patent_title": p.get("title", ""),
-                "claim_number": 0,
-                "claim_text": p.get("text_for_vector_db", ""),
-            }
-            for p in state["raw_patents"]
-        ]
-
-    context_type_map = {p["id"]: p.get("context_type", "claim") for p in state["raw_patents"]}
-
-    grouped: dict = {}
-    for hit in hits:
-        pid = hit["patent_id"]
-        hit_context_type = hit.get("context_type") or context_type_map.get(pid, "claim")
-        if pid not in grouped:
-            grouped[pid] = {
-                "patent_id": pid,
-                "patent_title": hit["patent_title"],
-                "claims": [],
-                "context_type": hit_context_type,
-            }
-        cn = hit["claim_number"]
-        if cn == 0:
-            label = "Abstract"
-        elif hit_context_type == "unformatted_claims":
-            label = "Claims (raw)"
+    try:
+        if collection is None:
+            print("chromadb session missing, using abstracts")
+            hits = []
         else:
-            label = f"Claim {cn}"
-        grouped[pid]["claims"].append(f"{label}: {hit['claim_text']}")
+            patent_ids = [p["id"] for p in state["raw_patents"]]
+            hits = retrieve_top_claims_per_patent(
+                collection, state["user_idea"], patent_ids, n_per_patent=2
+            )
 
-    grouped_list = list(grouped.values())
-    print(f"{len(grouped_list)} patents ready for risk check")
-    return {"decomposed_claims": grouped_list}
+        if not hits:
+            print("chromadb empty, using abstracts")
+            hits = [
+                {
+                    "patent_id": p["id"],
+                    "patent_title": p.get("title", ""),
+                    "claim_number": 0,
+                    "claim_text": p.get("text_for_vector_db", ""),
+                }
+                for p in state["raw_patents"]
+            ]
+
+        context_type_map = {p["id"]: p.get("context_type", "claim") for p in state["raw_patents"]}
+        claims_lang_map = {p["id"]: p.get("claims_lang", "") for p in state["raw_patents"]}
+
+        grouped = {}
+        for hit in hits:
+            pid = hit["patent_id"]
+            hit_context_type = hit.get("context_type") or context_type_map.get(pid, "claim")
+            if pid not in grouped:
+                grouped[pid] = {
+                    "patent_id": pid,
+                    "patent_title": hit["patent_title"],
+                    "claims": [],
+                    "context_type": hit_context_type,
+                    "claims_lang": claims_lang_map.get(pid, ""),
+                }
+            cn = hit["claim_number"]
+            if cn > 0 and hit_context_type == "claim":
+                grouped[pid]["claims"].append(f"Claim {cn}: {hit['claim_text']}")
+            else:
+                grouped[pid]["claims"].append(hit["claim_text"])
+
+        grouped_list = list(grouped.values())
+        print(f"{len(grouped_list)} patents ready for risk check")
+        return {"decomposed_claims": grouped_list}
+    finally:
+        drop_ephemeral_session(session_id)
 
 
 def node_assess_risk(state: FTOState):
@@ -397,12 +410,10 @@ def node_assess_risk(state: FTOState):
                     "  3. Determine whether the abstract describes physical mechanics that would "
                     "replicate or be equivalent to the user invention's components.\n\n"
                     "REASONING FORMAT — your reasoning field MUST:\n"
-                    "  • Begin with this exact disclaimer (copy verbatim): '[DISCLAIMER: Full claim "
-                    "text unavailable — assessment based on abstract summary only. A definitive FTO "
-                    "determination requires retrieval of the full patent claims.]'\n"
-                    "  • Follow with one sentence identifying the core structural technology described "
-                    "in the abstract and stating concretely whether it maps onto the user invention's "
-                    "components — naming those components explicitly.\n\n"
+                    "  • Write one or two clear sentences of user-facing analysis.\n"
+                    "  • Do NOT include bracketed disclaimers, meta-notes, or claim-layout caveats.\n"
+                    "  • Identify the core structural technology in the abstract and state whether it "
+                    "maps onto the user invention's components.\n\n"
                     f"User invention: '{state['user_idea']}'\n"
                     f"Patent abstract:\n{claims_block}\n\n"
                     "Return JSON with exactly these keys: risk_level (HIGH/MEDIUM/LOW), "
@@ -427,14 +438,37 @@ def node_assess_risk(state: FTOState):
                     "  3. Determine whether claimed physical mechanics are equivalent to any of the "
                     "user invention's structural components.\n\n"
                     "REASONING FORMAT — your reasoning field MUST:\n"
-                    "  • Begin with this exact disclaimer (copy verbatim): '[DISCLAIMER: Claims "
-                    "retrieved in unformatted layout — individual claim numbers not cited. Assessment "
-                    "is based on the full claim text provided.]'\n"
-                    "  • Follow with one sentence that names a specific structural mechanism found in "
-                    "the claim text and states explicitly whether it is mechanically equivalent to, or "
-                    "distinct from, the user invention's components — giving a concrete physical reason.\n\n"
+                    "  • Write one or two clear sentences of user-facing analysis.\n"
+                    "  • Do NOT include bracketed disclaimers or meta-notes.\n"
+                    "  • Name a specific structural mechanism in the claim text and state whether it is "
+                    "mechanically equivalent to, or distinct from, the user invention's components.\n\n"
                     f"User invention: '{state['user_idea']}'\n"
                     f"Patent claim text:\n{claims_block}\n\n"
+                    "Return JSON with exactly these keys: risk_level (HIGH/MEDIUM/LOW), "
+                    "overlap_score (float 0.0 to 1.0), reasoning (string)."
+                )
+
+            elif context_type == "non_english_claims":
+                claims_lang = item.get("claims_lang", "non-English")
+                prompt = (
+                    "You are a senior patent attorney performing a Freedom to Operate assessment. "
+                    "Respond ONLY with a valid JSON object — no explanation, no markdown fences.\n\n"
+                    f"⚠️  NON-ENGLISH CLAIMS MODE — claims below are in {claims_lang}, not English.\n"
+                    "No translation was applied. Assess only structural/mechanical elements you can "
+                    "identify with reasonable confidence.\n\n"
+                    "ABSOLUTE PROHIBITIONS (any violation is an error):\n"
+                    "  • Do NOT cite specific claim numbers.\n"
+                    "  • Do NOT base your score on isolated keywords.\n"
+                    "  • Do NOT use vague phrases such as 'shares similarities' or 'may overlap'.\n\n"
+                    "ELEMENT MAPPING — REQUIRED METHODOLOGY:\n"
+                    "  1. Decompose the user's invention into core structural components.\n"
+                    "  2. Identify mechanical elements in the claim text despite the language barrier.\n"
+                    "  3. Prefer LOW or MEDIUM unless structural equivalence is clear.\n\n"
+                    "REASONING FORMAT — your reasoning field MUST:\n"
+                    "  • Write one or two clear sentences without bracketed disclaimers.\n"
+                    "  • Note briefly that claim text was non-English, then give your structural assessment.\n\n"
+                    f"User invention: '{state['user_idea']}'\n"
+                    f"Patent claim text ({claims_lang}):\n{claims_block}\n\n"
                     "Return JSON with exactly these keys: risk_level (HIGH/MEDIUM/LOW), "
                     "overlap_score (float 0.0 to 1.0), reasoning (string)."
                 )
@@ -473,7 +507,7 @@ def node_assess_risk(state: FTOState):
                     "lateral nozzle aimed at vertical surfaces — mechanically distinct and non-infringing.'"
                 )
 
-            result = call_llm_with_retry(structured_risk_llm, prompt)
+            result = call_structured_with_retry(structured_risk_llm, prompt)
             assessment = {
                 "patent_id": item["patent_id"],
                 "risk_level": result.risk_level,
@@ -486,21 +520,41 @@ def node_assess_risk(state: FTOState):
                 "patent_id": item["patent_id"],
                 "risk_level": "UNKNOWN",
                 "overlap_score": 0.0,
-                "reasoning": f"Assessment unavailable: {type(exc).__name__}",
+                "reasoning": "Assessment unavailable.",
             }
         results.append(assessment)
 
-    return {"risk_assessments": results}
+    return {"risk_assessments": sort_assessments_by_overlap(results)}
 
 
 def node_human_review(state: FTOState):
     return {"human_approved": True}
 
 
+def _clearance_report(user_idea: str, cleared_count: int) -> str:
+    screened = (
+        f"{cleared_count} screened patent(s)"
+        if cleared_count
+        else "the assessed patent corpus"
+    )
+    return (
+        "## Executive Summary\n\n"
+        "No patents with significant structural overlap (score > 0.2) were identified "
+        "in the assessed corpus for the following invention:\n\n"
+        f"> {user_idea}\n\n"
+        f"After review of {screened}, no claims with mechanically equivalent "
+        "structural elements were found.\n\n"
+        "## Recommended Next Steps\n\n"
+        "- Proceed from an FTO perspective for the assessed patent set\n"
+        "- Re-screen periodically as the patent landscape evolves\n"
+        "- Obtain jurisdiction-specific counsel before commercialization"
+    )
+
+
 def node_write_report(state: FTOState):
     print("writing final report...")
 
-    all_assessments = state["risk_assessments"]
+    all_assessments = sort_assessments_by_overlap(state["risk_assessments"])
     bucket_a = [
         a for a in all_assessments
         if (a.get("overlap_score") or 0) > _SIGNIFICANT_OVERLAP_THRESHOLD
@@ -512,96 +566,97 @@ def node_write_report(state: FTOState):
 
     print(f"high overlap: {len(bucket_a)}, cleared: {len(bucket_b)}")
 
-    if not bucket_a:
-        no_risk_prompt = (
-            "You are a senior patent attorney drafting a formal Freedom to Operate clearance "
-            "memorandum. Your response MUST be a valid JSON object matching the required schema "
-            "— no markdown fences, no extra keys.\n\n"
-            "=== SCHEMA ===\n"
-            '{"report": "<markdown string>", "assessments": []}\n\n'
-            "=== REPORT INSTRUCTIONS ===\n"
-            f"Invention: {state['user_idea']}\n\n"
-            "No patents with significant structural overlap (score > 0.2) were identified after "
-            "exhaustive prior-art analysis. Write a concise, professionally worded FTO clearance "
-            "statement in markdown.\n\n"
-            "CRITICAL WRITING DIRECTIVE — Professional Legal Synthesis:\n"
-            "  • Write in a definitive, legally rigorous tone — no hedging language.\n"
-            "  • Do NOT invent or reference any patent IDs.\n"
-            "  • The clearance statement should briefly characterise the user's invention by its "
-            "core structural components and state that no claims with mechanically equivalent "
-            "elements were identified in the assessed patent corpus.\n\n"
-            "Keep the `assessments` array empty ([]).\n"
-            "Structure: Executive Summary, Recommended Next Steps."
+    try:
+        if not bucket_a:
+            return {
+                "final_report": _clearance_report(
+                    state["user_idea"], len(bucket_b)
+                ),
+                "risk_assessments": [],
+                "cleared_patents": bucket_b,
+            }
+
+        allowed_ids = {a["patent_id"] for a in bucket_a}
+        structured_summary = "\n".join(
+            f"Patent {a['patent_id']}: {a['risk_level']} risk "
+            f"(overlap: {a['overlap_score']}) — {a['reasoning']}"
+            for a in bucket_a
         )
-        result = call_llm_with_retry(structured_report_llm, no_risk_prompt)
+        assessments_json = json.dumps(bucket_a, indent=2)
+        patent_count = len(bucket_a)
+
+        base_prompt = (
+            "You are a senior patent attorney drafting a formal Executive Freedom to Operate "
+            "Analysis Report. Your response MUST be a valid JSON object matching the required "
+            "schema — no markdown fences, no extra keys.\n\n"
+            "=== SCHEMA ===\n"
+            '{"report": "<markdown string>", "assessments": [<array — see below>]}\n\n'
+            "=== REPORT INSTRUCTIONS ===\n"
+            "Write a professional FTO analysis report in markdown. You are analyzing ONLY patents "
+            "with significant structural overlap (score > 0.2). Do NOT reference or invent any "
+            "patents not listed below.\n\n"
+            "CRITICAL — COMPLETENESS RULE:\n"
+            f"You have been provided with exactly {patent_count} significant patent(s). "
+            "You MUST discuss every single one in your report.\n\n"
+            "CRITICAL WRITING DIRECTIVE — Professional Legal Synthesis:\n"
+            "  • You are STRICTLY FORBIDDEN from using shallow descriptions such as 'due to the "
+            "phrase X' or 'because it contains the keyword Y'.\n"
+            "  • For every patent discussed, you MUST synthesise the structural overlap: explain "
+            "the technical interaction between the patent's claimed mechanical elements and the "
+            "user invention's core structural components.\n"
+            "  • Maintain a highly professional, definitive, and legally rigorous tone throughout. "
+            "Avoid hedging language (e.g., 'may', 'could', 'might potentially').\n"
+            "  • Each patent's risk must be characterised by mechanical element analysis, not "
+            "keyword proximity.\n\n"
+            f"Invention: {state['user_idea']}\n"
+            f"Significant Patent Risk Assessments ({patent_count} total):\n"
+            f"{structured_summary}\n\n"
+            "Structure the report with: Executive Summary, Key Risk Patents, "
+            "and Recommended Next Steps.\n\n"
+            "=== ASSESSMENTS INSTRUCTIONS ===\n"
+            "For the `assessments` output field copy the following JSON array EXACTLY "
+            "as-is — do NOT modify, summarise, reorder, or omit any entry:\n"
+            f"{assessments_json}"
+        )
+
+        prompt = base_prompt
+        result = None
+        for attempt in range(1, 4):
+            result = call_structured_with_retry(structured_report_llm, prompt)
+            hallucinated = find_hallucinated_patent_ids(result.report, allowed_ids)
+            if not hallucinated:
+                break
+            print(f"report cited unknown patents {hallucinated}, retry {attempt}...")
+            prompt = (
+                f"{base_prompt}\n\n"
+                f"ERROR: Your report cited these patent IDs which are NOT in the allowed list: "
+                f"{sorted(hallucinated)}. Allowed IDs ONLY: {sorted(allowed_ids)}. "
+                "Regenerate without inventing or adding any other patent IDs."
+            )
+
+        llm_assessments = [a.model_dump() for a in result.assessments]
+        if len(llm_assessments) < patent_count:
+            print(
+                f"report missing {patent_count - len(llm_assessments)} assessments, filling in"
+            )
+            llm_ids = {a["patent_id"] for a in llm_assessments}
+            for original in bucket_a:
+                if original["patent_id"] not in llm_ids:
+                    llm_assessments.append(original)
+
         return {
             "final_report": result.report,
-            "risk_assessments": [],
-            "cleared_patents": bucket_b,
+            "risk_assessments": sort_assessments_by_overlap(llm_assessments),
+            "cleared_patents": sort_assessments_by_overlap(bucket_b),
         }
-
-    structured_summary = "\n".join(
-        f"Patent {a['patent_id']}: {a['risk_level']} risk "
-        f"(overlap: {a['overlap_score']}) — {a['reasoning']}"
-        for a in bucket_a
-    )
-    assessments_json = json.dumps(bucket_a, indent=2)
-    patent_count = len(bucket_a)
-
-    prompt = (
-        "You are a senior patent attorney drafting a formal Executive Freedom to Operate "
-        "Analysis Report. Your response MUST be a valid JSON object matching the required "
-        "schema — no markdown fences, no extra keys.\n\n"
-        "=== SCHEMA ===\n"
-        '{"report": "<markdown string>", "assessments": [<array — see below>]}\n\n'
-        "=== REPORT INSTRUCTIONS ===\n"
-        "Write a professional FTO analysis report in markdown. You are analyzing ONLY patents "
-        "with significant structural overlap (score > 0.2). Do NOT reference or invent any "
-        "patents not listed below.\n\n"
-        "CRITICAL — COMPLETENESS RULE:\n"
-        f"You have been provided with exactly {patent_count} significant patent(s). "
-        "You MUST discuss every single one in your report.\n\n"
-        "CRITICAL WRITING DIRECTIVE — Professional Legal Synthesis:\n"
-        "  • You are STRICTLY FORBIDDEN from using shallow descriptions such as 'due to the "
-        "phrase X' or 'because it contains the keyword Y'.\n"
-        "  • For every patent discussed, you MUST synthesise the structural overlap: explain "
-        "the technical interaction between the patent's claimed mechanical elements and the "
-        "user invention's core structural components.\n"
-        "  • Example of FORBIDDEN writing: 'Patent X presents risk due to the phrase "
-        "\"aerial fluid delivery\".'\n"
-        "  • Example of REQUIRED writing: 'Patent X presents a HIGH risk because it claims "
-        "an unmanned aerial platform structurally integrated with a surface-targeted liquid "
-        "projection assembly — directly replicating the foundational multi-component mechanics "
-        "of the user's invention.'\n"
-        "  • Maintain a highly professional, definitive, and legally rigorous tone throughout. "
-        "Avoid hedging language (e.g., 'may', 'could', 'might potentially').\n"
-        "  • Each patent's risk must be characterised by mechanical element analysis, not "
-        "keyword proximity.\n\n"
-        f"Invention: {state['user_idea']}\n"
-        f"Significant Patent Risk Assessments ({patent_count} total):\n"
-        f"{structured_summary}\n\n"
-        "Structure the report with: Executive Summary, Key Risk Patents, "
-        "and Recommended Next Steps.\n\n"
-        "=== ASSESSMENTS INSTRUCTIONS ===\n"
-        "For the `assessments` output field copy the following JSON array EXACTLY "
-        "as-is — do NOT modify, summarise, reorder, or omit any entry:\n"
-        f"{assessments_json}"
-    )
-
-    result = call_llm_with_retry(structured_report_llm, prompt)
-
-    llm_assessments = [a.model_dump() for a in result.assessments]
-    if len(llm_assessments) < patent_count:
-        print(
-            f"report missing {patent_count - len(llm_assessments)} assessments, filling in"
-        )
-        llm_ids = {a["patent_id"] for a in llm_assessments}
-        for original in bucket_a:
-            if original["patent_id"] not in llm_ids:
-                llm_assessments.append(original)
-
-    return {
-        "final_report": result.report,
-        "risk_assessments": llm_assessments,
-        "cleared_patents": bucket_b,
-    }
+    except Exception as exc:
+        print(f"report generation failed: {exc}")
+        return {
+            "final_report": (
+                f"## FTO Report Unavailable\n\n"
+                "Automated report generation failed. "
+                "Preliminary risk assessments are still available above."
+            ),
+            "risk_assessments": sort_assessments_by_overlap(bucket_a),
+            "cleared_patents": sort_assessments_by_overlap(bucket_b),
+        }
