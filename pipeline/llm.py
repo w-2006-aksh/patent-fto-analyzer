@@ -10,9 +10,9 @@ from .state import RiskAssessment, FTOReport, RelevanceBatch
 load_dotenv()
 
 llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0)
-structured_risk_llm = llm.with_structured_output(RiskAssessment, method="json_schema")
-structured_report_llm = llm.with_structured_output(FTOReport, method="json_schema")
-structured_relevance_llm = llm.with_structured_output(RelevanceBatch, method="json_schema")
+structured_risk_llm = llm.with_structured_output(RiskAssessment, method="json_mode")
+structured_report_llm = llm.with_structured_output(FTOReport, method="json_mode")
+structured_relevance_llm = llm.with_structured_output(RelevanceBatch, method="json_mode")
 
 _LLM_CALL_DELAY = 4
 _last_llm_call_time: float = 0.0
