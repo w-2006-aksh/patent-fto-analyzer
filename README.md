@@ -14,12 +14,12 @@ The core engine is built on an 11-stage **LangGraph** pipeline with the followin
 
 * **Human-in-the-Loop (HITL) Checkpointing:** The LangGraph pipeline pauses at a checkpoint, presenting preliminary risk cards to the user for approval before spending API tokens on final markdown report generation.
 
-* **Token Pacing & Fault Tolerance:** Built with rolling TPM/RPM pacing to keep multi-call LLM workloads safely within Groq's free-tier limits, alongside quality-gated autonomous retries for JSON parse failures.
+* **Token Pacing & Fault Tolerance:** Built with rolling TPM/RPM pacing and daily request budget (RPD) tracking to keep multi-call LLM workloads safely within Groq's free-tier limits, alongside quality-gated autonomous retries for JSON parse failures.
 
 ## Tech Stack
 
 * **Backend:** Python, FastAPI, LangGraph, LangChain
-* **AI & Vector DB:** Groq (Llama 3.3 70B), ChromaDB (Local)
+* **AI & Vector DB:** Groq (GPT-OSS 120B), ChromaDB (Local)
 * **Frontend:** React 19, Vite, Tailwind CSS
 * **External APIs:** EPO OPS REST API
 

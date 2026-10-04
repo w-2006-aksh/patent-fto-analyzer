@@ -371,8 +371,8 @@ def node_assess_risk(state: FTOState):
     print("checking infringement risk...")
     results: List[dict] = []
 
-    max_single_claim = 5_000
-    max_claim_block = 10_000
+    max_single_claim = 4_000
+    max_claim_block = 8_000
 
     for item in state["decomposed_claims"]:
         safe_claims = []

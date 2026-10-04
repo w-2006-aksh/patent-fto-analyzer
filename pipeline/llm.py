@@ -9,20 +9,25 @@ from .state import RiskAssessment, FTOReport, RelevanceBatch
 
 load_dotenv()
 
-llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
-structured_risk_llm = llm.with_structured_output(RiskAssessment, method="json_mode")
-structured_report_llm = llm.with_structured_output(FTOReport, method="json_mode")
-structured_relevance_llm = llm.with_structured_output(RelevanceBatch, method="json_mode")
+llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0)
+structured_risk_llm = llm.with_structured_output(RiskAssessment, method="json_schema")
+structured_report_llm = llm.with_structured_output(FTOReport, method="json_schema")
+structured_relevance_llm = llm.with_structured_output(RelevanceBatch, method="json_schema")
 
-_LLM_CALL_DELAY = 3
+_LLM_CALL_DELAY = 4
 _last_llm_call_time: float = 0.0
 
-# groq tpm cap
-_TPM_LIMIT = 10_000
+# groq free-tier tpm cap (gpt-oss-120b)
+_TPM_LIMIT = 8_000
 _TPM_WINDOW_SEC = 60.0
 _tpm_history: deque[tuple[float, int]] = deque()
 _CHARS_PER_TOKEN = 4
 _llm_lock = threading.Lock()
+
+# groq free-tier daily request cap (gpt-oss-120b)
+_RPD_LIMIT = 1_000
+_rpd_count = 0
+_rpd_reset_time: float = 0.0
 
 
 def _is_rate_limit_error(exc: Exception) -> bool:
@@ -58,7 +63,23 @@ def _prune_tpm_history() -> int:
     return sum(tokens for _, tokens in _tpm_history)
 
 
-def _check_tpm_budget(prompt: str, response_budget: int = 400):
+def _check_rpd_budget():
+    """Guard against exceeding the daily request limit."""
+    global _rpd_count, _rpd_reset_time
+    now = time.time()
+    if now >= _rpd_reset_time:
+        _rpd_count = 0
+        _rpd_reset_time = now + 86_400  # 24h window
+    if _rpd_count >= _RPD_LIMIT:
+        wait = _rpd_reset_time - now
+        raise RuntimeError(
+            f"Daily request limit ({_RPD_LIMIT}) reached. "
+            f"Resets in {wait / 3600:.1f}h."
+        )
+    _rpd_count += 1
+
+
+def _check_tpm_budget(prompt: str, response_budget: int = 600):
     estimated = len(prompt) // _CHARS_PER_TOKEN + response_budget
     used = _prune_tpm_history()
 
@@ -78,6 +99,7 @@ def call_llm_with_retry(llm_instance, prompt, max_retries: int = 5):
 
     with _llm_lock:
         prompt_str = str(prompt)
+        _check_rpd_budget()
         _throttle_llm_call()
         _check_tpm_budget(prompt_str)
 
@@ -111,6 +133,7 @@ def call_structured_with_retry(llm_instance, prompt, max_retries: int = 3):
     with _llm_lock:
         prompt_str = str(prompt)
         last_exc = None
+        _check_rpd_budget()
 
         for attempt in range(1, max_retries + 1):
             _throttle_llm_call()
