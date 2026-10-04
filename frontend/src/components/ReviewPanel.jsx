@@ -1,9 +1,12 @@
 import { riskBorderClass, riskBadgeClass } from "../utils.js";
 
 export default function ReviewPanel({ idea, assessments, onApprove }) {
-  const highCount   = assessments.filter(a => a.risk_level?.toUpperCase() === "HIGH").length;
-  const mediumCount = assessments.filter(a => a.risk_level?.toUpperCase() === "MEDIUM").length;
-  const lowCount    = assessments.filter(a => a.risk_level?.toUpperCase() === "LOW").length;
+  const significant = assessments.filter(a => (a.overlap_score || 0) > 0.2);
+  const cleared = assessments.filter(a => (a.overlap_score || 0) <= 0.2);
+
+  const highCount   = significant.filter(a => a.risk_level?.toUpperCase() === "HIGH").length;
+  const mediumCount = significant.filter(a => a.risk_level?.toUpperCase() === "MEDIUM").length;
+  const lowCount    = significant.filter(a => a.risk_level?.toUpperCase() === "LOW").length;
 
   return (
     <>
@@ -34,21 +37,36 @@ export default function ReviewPanel({ idea, assessments, onApprove }) {
         {assessments.length === 0 ? (
           <p className="text-slate-400 text-sm italic">No patents were assessed.</p>
         ) : (
-          assessments.map((a) => (
-            <div
-              key={a.patent_id}
-              className={`border-l-4 rounded-lg bg-slate-800/80 p-4 ${riskBorderClass(a.risk_level)}`}
-            >
-              <div className="flex items-center justify-between mb-1">
-                <span className="text-white font-mono text-sm">{a.patent_id}</span>
-                <span className={`px-2 py-1 rounded-full text-xs font-bold ${riskBadgeClass(a.risk_level)}`}>
-                  {a.risk_level}
-                </span>
+          <>
+            {significant.map((a) => (
+              <div
+                key={a.patent_id}
+                className={`border-l-4 rounded-lg bg-slate-800/80 p-4 ${riskBorderClass(a.risk_level)}`}
+              >
+                <div className="flex items-center justify-between mb-1">
+                  <span className="text-white font-mono text-sm">{a.patent_id}</span>
+                  <span className={`px-2 py-1 rounded-full text-xs font-bold ${riskBadgeClass(a.risk_level)}`}>
+                    {a.risk_level}
+                  </span>
+                </div>
+                <p className="text-slate-400 text-xs mb-1">Overlap: {a.overlap_score}</p>
+                <p className="text-slate-300 text-xs leading-relaxed">{a.reasoning}</p>
               </div>
-              <p className="text-slate-400 text-xs mb-1">Overlap: {a.overlap_score}</p>
-              <p className="text-slate-300 text-xs leading-relaxed">{a.reasoning}</p>
-            </div>
-          ))
+            ))}
+            {cleared.length > 0 && (
+              <div className="mt-4 pt-4 border-t border-slate-700">
+                <p className="text-slate-400 text-xs mb-2">
+                  {cleared.length} patent{cleared.length !== 1 ? "s" : ""} cleared (overlap ≤ 0.2) and excluded from significant risk counts:
+                </p>
+                {cleared.map((a) => (
+                  <div key={a.patent_id} className="flex justify-between items-center text-xs text-slate-500 mb-1">
+                    <span className="font-mono">{a.patent_id}</span>
+                    <span>Overlap: {a.overlap_score} | {a.risk_level}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </>
         )}
       </div>
 
